@@ -17,4 +17,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: sketch/build/**/*.merged.bin
+          path: |
+            sketch/build/**/sketch.ino.bootloader.bin
+            sketch/build/**/sketch.ino.partitions.bin
+            sketch/build/**/sketch.ino.bin
