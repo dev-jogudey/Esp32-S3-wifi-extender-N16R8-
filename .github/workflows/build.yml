@@ -13,7 +13,7 @@ jobs:
           arduino-cli core install esp32:esp32 --additional-urls $URL
           mkdir -p sketch
           cp nat_extender.ino sketch/sketch.ino
-          arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=default_16MB,FlashMode=qio" --export-binaries sketch
+          arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=huge_app,FlashMode=qio" --export-binaries sketch
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
