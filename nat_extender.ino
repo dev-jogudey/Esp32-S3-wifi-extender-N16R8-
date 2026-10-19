@@ -1,5 +1,4 @@
- // ESP32 WiFi Extender (NAT) + Web Settings
-// Settings page: connect to the extender WiFi, open http://192.168.4.1
+// ESP32-S3 WiFi Extender (NAT) + Web Settings + Heat Protection
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -9,7 +8,22 @@ WebServer server(80);
 Preferences prefs;
 
 String staSsid, staPass, apSsid, apPass;
+int txIdx = 3;
 bool natOn = false;
+bool throttled = false;
+float chipTemp = 0;
+unsigned long lastTemp = 0;
+unsigned long lastTry = 0;
+
+const wifi_power_t TX_LEVELS[] = {
+  WIFI_POWER_8_5dBm, WIFI_POWER_11dBm, WIFI_POWER_15dBm,
+  WIFI_POWER_17dBm, WIFI_POWER_19_5dBm
+};
+const char *TX_NAMES[] = {
+  "8.5 dBm (coolest, short range)", "11 dBm", "15 dBm",
+  "17 dBm (default)", "19.5 dBm (max range, hottest)"
+};
+const int TX_COUNT = 5;
 
 String htmlEsc(const String &s) {
   String o;
@@ -28,7 +42,9 @@ void loadSettings() {
   staPass = prefs.getString("staP", "");
   apSsid  = prefs.getString("apS", "ESP32_Extender");
   apPass  = prefs.getString("apP", "12345678");
+  txIdx   = prefs.getInt("tx", 3);
   prefs.end();
+  if (txIdx < 0 || txIdx >= TX_COUNT) txIdx = 3;
 }
 
 void saveSettings() {
@@ -37,7 +53,33 @@ void saveSettings() {
   prefs.putString("staP", staPass);
   prefs.putString("apS", apSsid);
   prefs.putString("apP", apPass);
+  prefs.putInt("tx", txIdx);
   prefs.end();
+}
+
+void applyPower() {
+  if (throttled) {
+    setCpuFrequencyMhz(80);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  } else {
+    setCpuFrequencyMhz(160);
+    WiFi.setTxPower(TX_LEVELS[txIdx]);
+  }
+}
+
+void checkTemp() {
+  if (millis() - lastTemp < 5000) return;
+  lastTemp = millis();
+  float t = temperatureRead();
+  if (isnan(t)) return;
+  chipTemp = t;
+  if (!throttled && chipTemp >= 70.0) {
+    throttled = true;
+    applyPower();
+  } else if (throttled && chipTemp <= 60.0) {
+    throttled = false;
+    applyPower();
+  }
 }
 
 void enableNat() {
@@ -56,25 +98,39 @@ void enableNat() {
 }
 
 void handleRoot() {
-  String st = (WiFi.status() == WL_CONNECTED)
-                ? "Connected to " + htmlEsc(WiFi.SSID()) + " (IP " + WiFi.localIP().toString() + ")"
-                : "Not connected";
-  String h = "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-             "<title>WiFi Extender</title><style>body{font-family:sans-serif;max-width:420px;margin:20px auto;padding:0 12px}"
-             "input,button{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;font-size:16px}"
-             "button{background:#2a7;color:#fff;border:0;border-radius:6px}</style></head><body>"
-             "<h2>WiFi Extender</h2><p><b>Status:</b> " + st + "<br><b>NAT:</b> " + (natOn ? "ON" : "OFF") +
-             "<br><b>Clients:</b> " + String(WiFi.softAPgetStationNum()) + "</p>"
-             "<form method=POST action=/save>"
-             "<h3>Main WiFi (internet source)</h3>"
-             "<input name=ssid placeholder='WiFi name' value=\"" + htmlEsc(staSsid) + "\">"
-             "<input name=pass type=password placeholder='WiFi password' value=\"" + htmlEsc(staPass) + "\">"
-             "<h3>Extender WiFi (what you share)</h3>"
-             "<input name=assid placeholder='Extender name' value=\"" + htmlEsc(apSsid) + "\">"
-             "<input name=apass type=password placeholder='Extender password (min 8, empty = open)' value=\"" + htmlEsc(apPass) + "\">"
-             "<button type=submit>Save &amp; Restart</button></form>"
-             "<form method=POST action=/scan><button style='background:#357'>Scan WiFi list</button></form>"
-             "</body></html>";
+  String h;
+  h.reserve(4000);
+  h += "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
+  h += "<title>WiFi Extender</title><style>body{font-family:sans-serif;max-width:420px;margin:20px auto;padding:0 12px}";
+  h += "input,button,select{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;font-size:16px}";
+  h += "button{background:#2a7;color:#fff;border:0;border-radius:6px}</style></head><body>";
+  h += "<h2>WiFi Extender</h2><p><b>Status:</b> ";
+  if (WiFi.status() == WL_CONNECTED) {
+    h += "Connected to " + htmlEsc(WiFi.SSID()) + " (IP " + WiFi.localIP().toString() + ")";
+  } else {
+    h += "Not connected";
+  }
+  h += "<br><b>NAT:</b> ";
+  h += natOn ? "ON" : "OFF";
+  h += "<br><b>Clients:</b> " + String(WiFi.softAPgetStationNum());
+  h += "<br><b>Chip temp:</b> " + String(chipTemp, 1) + " C";
+  if (throttled) h += " (TOO HOT - power reduced)";
+  h += "<br><b>CPU:</b> " + String(getCpuFrequencyMhz()) + " MHz</p>";
+  h += "<form method=POST action=/save>";
+  h += "<h3>Main WiFi (internet source)</h3>";
+  h += "<input name=ssid placeholder='WiFi name' value=\"" + htmlEsc(staSsid) + "\">";
+  h += "<input name=pass type=password placeholder='WiFi password' value=\"" + htmlEsc(staPass) + "\">";
+  h += "<h3>Extender WiFi (what you share)</h3>";
+  h += "<input name=assid placeholder='Extender name' value=\"" + htmlEsc(apSsid) + "\">";
+  h += "<input name=apass type=password placeholder='Extender password (min 8, empty = open)' value=\"" + htmlEsc(apPass) + "\">";
+  h += "<h3>WiFi power (range vs heat)</h3><select name=tx>";
+  for (int i = 0; i < TX_COUNT; i++) {
+    h += "<option value=" + String(i) + (i == txIdx ? " selected" : "") + ">" + TX_NAMES[i] + "</option>";
+  }
+  h += "</select>";
+  h += "<button type=submit>Save &amp; Restart</button></form>";
+  h += "<form method=POST action=/scan><button style='background:#357'>Scan WiFi list</button></form>";
+  h += "</body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -94,6 +150,8 @@ void handleSave() {
   staPass = server.arg("pass");
   apSsid = server.arg("assid");
   apPass = server.arg("apass");
+  txIdx = server.arg("tx").toInt();
+  if (txIdx < 0 || txIdx >= TX_COUNT) txIdx = 3;
   if (apSsid.length() == 0) apSsid = "ESP32_Extender";
   if (apPass.length() > 0 && apPass.length() < 8) apPass = "12345678";
   saveSettings();
@@ -105,12 +163,15 @@ void handleSave() {
 
 void setup() {
   Serial.begin(115200);
+  setCpuFrequencyMhz(160);
   delay(300);
   loadSettings();
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.softAP(apSsid.c_str(), apPass.length() ? apPass.c_str() : nullptr);
   if (staSsid.length()) WiFi.begin(staSsid.c_str(), staPass.c_str());
+  applyPower();
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
@@ -119,10 +180,10 @@ void setup() {
   Serial.println("Settings page: http://192.168.4.1");
 }
 
-unsigned long lastTry = 0;
-
 void loop() {
   server.handleClient();
+  checkTemp();
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!natOn) {
       enableNat();
@@ -135,4 +196,5 @@ void loop() {
       WiFi.reconnect();
     }
   }
+  delay(2);
 }
