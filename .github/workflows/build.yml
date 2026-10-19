@@ -1,0 +1,20 @@
+name: build
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Build for ESP32-S3 N16R8
+        run: |
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls $URL
+          arduino-cli core install esp32:esp32 --additional-urls $URL
+          mkdir -p sketch
+          cp nat_extender.ino sketch/sketch.ino
+          arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=default_16MB,FlashMode=qio" --export-binaries sketch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: sketch/build/**/*.merged.bin
