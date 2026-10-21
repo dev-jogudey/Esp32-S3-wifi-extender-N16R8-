@@ -1,4 +1,4 @@
-// ESP32-S3 WiFi Extender (NAT) + Web Settings + Heat Protection
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -14,6 +14,7 @@ bool throttled = false;
 float chipTemp = 0;
 unsigned long lastTemp = 0;
 unsigned long lastTry = 0;
+unsigned long lostSince = 0;
 
 const wifi_power_t TX_LEVELS[] = {
   WIFI_POWER_8_5dBm, WIFI_POWER_11dBm, WIFI_POWER_15dBm,
@@ -27,11 +28,30 @@ const int TX_COUNT = 5;
 
 String htmlEsc(const String &s) {
   String o;
-  for (char c : s) {
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
     if (c == '"') o += "&quot;";
     else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
     else if (c == '&') o += "&amp;";
+    else if (c == '\'') o += "&#39;";
     else o += c;
+  }
+  return o;
+}
+
+String urlEnc(const String &s) {
+  String o;
+  char buf[4];
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        c == '-' || c == '_' || c == '.') {
+      o += (char)c;
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", c);
+      o += buf;
+    }
   }
   return o;
 }
@@ -98,6 +118,7 @@ void enableNat() {
 }
 
 void handleRoot() {
+  String ssidVal = server.hasArg("s") ? server.arg("s") : staSsid;
   String h;
   h.reserve(4000);
   h += "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
@@ -118,8 +139,8 @@ void handleRoot() {
   h += "<br><b>CPU:</b> " + String(getCpuFrequencyMhz()) + " MHz</p>";
   h += "<form method=POST action=/save>";
   h += "<h3>Main WiFi (internet source)</h3>";
-  h += "<input name=ssid placeholder='WiFi name' value=\"" + htmlEsc(staSsid) + "\">";
-  h += "<input name=pass type=password placeholder='WiFi password' value=\"" + htmlEsc(staPass) + "\">";
+  h += "<input name=ssid placeholder='WiFi name' value=\"" + htmlEsc(ssidVal) + "\">";
+  h += "<input name=pass type=password placeholder='WiFi password (empty = keep saved)'>";
   h += "<h3>Extender WiFi (what you share)</h3>";
   h += "<input name=assid placeholder='Extender name' value=\"" + htmlEsc(apSsid) + "\">";
   h += "<input name=apass type=password placeholder='Extender password (min 8, empty = open)' value=\"" + htmlEsc(apPass) + "\">";
@@ -129,25 +150,44 @@ void handleRoot() {
   }
   h += "</select>";
   h += "<button type=submit>Save &amp; Restart</button></form>";
-  h += "<form method=POST action=/scan><button style='background:#357'>Scan WiFi list</button></form>";
+  h += "<form method=GET action=/scan><button type=submit style='background:#357'>Scan WiFi list</button></form>";
   h += "</body></html>";
   server.send(200, "text/html", h);
 }
 
-void handleScan() {
-  int n = WiFi.scanNetworks();
-  String h = "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
-             "<body style='font-family:sans-serif'><h3>Nearby WiFi</h3>";
-  for (int i = 0; i < n; i++) {
-    h += htmlEsc(WiFi.SSID(i)) + " (" + String(WiFi.RSSI(i)) + " dBm)<br>";
+void handleScanStart() {
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);
+  server.sendHeader("Location", "/scanresult");
+  server.send(303, "text/plain", "");
+}
+
+void handleScanResult() {
+  int n = WiFi.scanComplete();
+  String h = "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
+  if (n == WIFI_SCAN_RUNNING) h += "<meta http-equiv=refresh content='3'>";
+  h += "</head><body style='font-family:sans-serif;padding:0 12px'><h3>Nearby WiFi</h3>";
+  if (n == WIFI_SCAN_RUNNING) {
+    h += "<p>Scanning... please wait</p>";
+  } else if (n < 0) {
+    h += "<p>Scan failed. <a href=/scan>Try again</a></p>";
+  } else {
+    if (n == 0) h += "<p>No networks found.</p>";
+    for (int i = 0; i < n; i++) {
+      h += "<p><a href='/?s=" + urlEnc(WiFi.SSID(i)) + "'>" + htmlEsc(WiFi.SSID(i)) + "</a> (" + String(WiFi.RSSI(i)) + " dBm)</p>";
+    }
+    h += "<p><a href=/scan>Scan again</a></p>";
   }
   h += "<p><a href=/>Back</a></p></body></html>";
   server.send(200, "text/html", h);
 }
 
 void handleSave() {
-  staSsid = server.arg("ssid");
-  staPass = server.arg("pass");
+  String newSsid = server.arg("ssid");
+  String newPass = server.arg("pass");
+  // empty password + same WiFi name = keep the saved password
+  if (newPass.length() > 0 || newSsid != staSsid) staPass = newPass;
+  staSsid = newSsid;
   apSsid = server.arg("assid");
   apPass = server.arg("apass");
   txIdx = server.arg("tx").toInt();
@@ -168,14 +208,15 @@ void setup() {
   loadSettings();
 
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(true);   // WiFi retries by itself, no manual reconnect spam
   WiFi.softAP(apSsid.c_str(), apPass.length() ? apPass.c_str() : nullptr);
   if (staSsid.length()) WiFi.begin(staSsid.c_str(), staPass.c_str());
   applyPower();
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.on("/scan", HTTP_POST, handleScan);
+  server.on("/scan", handleScanStart);
+  server.on("/scanresult", handleScanResult);
   server.begin();
   Serial.println("Settings page: http://192.168.4.1");
 }
@@ -185,15 +226,21 @@ void loop() {
   checkTemp();
 
   if (WiFi.status() == WL_CONNECTED) {
+    lostSince = 0;
     if (!natOn) {
       enableNat();
       Serial.printf("Connected, NAT %s, IP %s\n", natOn ? "ON" : "FAILED", WiFi.localIP().toString().c_str());
     }
   } else {
     natOn = false;
-    if (staSsid.length() && millis() - lastTry > 10000) {
+    if (lostSince == 0) lostSince = millis();
+    // Safety net only: after 60 s without internet, and only when nobody is
+    // connected to our hotspot, start a fresh connect attempt (it can briefly
+    // interrupt the hotspot, so never do it while a phone is connected).
+    if (staSsid.length() && millis() - lostSince > 60000 && millis() - lastTry > 60000 &&
+        WiFi.softAPgetStationNum() == 0) {
       lastTry = millis();
-      WiFi.reconnect();
+      WiFi.begin(staSsid.c_str(), staPass.c_str());
     }
   }
   delay(2);
